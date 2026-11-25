@@ -1,69 +1,135 @@
+
 import pandas as pd
 import numpy as np
+
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
 from app.features import build_features, FEATURE_COLS
 from app.forecasting import load_forecaster
 
+
 def run_evaluation():
-    print("Loading data...")
-    df = pd.read_csv("data/consumption.csv", parse_dates=["timestamp"])
-    
-    # We know the synthetic data has massive anomalies injected at indices 4000, 6000, 7500.
-    # Let's create ground truth labels (1 = anomaly, 0 = normal) for evaluation.
-    labels = pd.Series(0, index=range(len(df)))
-    labels.iloc[4000] = 1
-    labels.iloc[6000] = 1
-    labels.iloc[7500] = 1
 
+    # 1. Load real processed Kaggle data
+    print("Loading real electricity consumption data...")
+
+    df = pd.read_csv(
+        "data/consumption.csv",
+        parse_dates=["timestamp"]
+    )
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    print(f"Total records: {len(df)}")
+
+    # 2. Build features
     feats = build_features(df)
-    # Align labels with dropped NaN rows from feature engineering
-    labels = labels.iloc[-len(feats):].reset_index(drop=True)
+
+    feats = feats.dropna(subset=FEATURE_COLS + ["consumption_kwh"])
+
     X = feats[FEATURE_COLS]
+    y = feats["consumption_kwh"]
 
-    # --- 1. Standalone Isolation Forest ---
-    iso = IsolationForest(contamination=0.01, random_state=42)
-    iso.fit(X)
-    iso_pred = (iso.predict(X) == -1).astype(int)
+    # 3. Chronological 80-20 train-test split
+    split_index = int(len(feats) * 0.80)
 
-    # --- 2. Forecast-based ---
+    X_train = X.iloc[:split_index]
+    X_test = X.iloc[split_index:]
+
+    y_test = y.iloc[split_index:]
+
+    test_data = feats.iloc[split_index:]
+
+    print(f"Training records: {len(X_train)}")
+    print(f"Testing records: {len(X_test)}")
+
+    # 4. Standalone Isolation Forest
+    iso = IsolationForest(
+        contamination=0.01,
+        random_state=42
+    )
+
+    iso.fit(X_train)
+
+    iso_pred = (iso.predict(X_test) == -1).astype(int)
+
+    # 5. Forecast-based anomaly detection
     model = load_forecaster()
-    preds = model.predict(X)
-    residual = feats["consumption_kwh"].values - preds
-    rolling_std = feats["rolling_std_24h"].replace(0, np.nan).fillna(1.0).values
+
+    preds = model.predict(X_test)
+
+    residual = y_test.values - preds
+
+    rolling_std = (
+        test_data["rolling_std_24h"]
+        .replace(0, np.nan)
+        .fillna(1.0)
+        .values
+    )
+
     z_scores = residual / rolling_std
+
     forecast_pred = (np.abs(z_scores) > 2.5).astype(int)
 
-    # --- 3. Hybrid ---
-    hybrid_pred = ((forecast_pred == 1) | ((iso_pred == 1) & (np.abs(z_scores) > 1.5))).astype(int)
+    # 6. Hybrid anomaly detection
+    hybrid_pred = (
+        (forecast_pred == 1) |
+        ((iso_pred == 1) & (np.abs(z_scores) > 1.5))
+    ).astype(int)
 
-    # --- Evaluation Metrics ---
-    def get_metrics(name, preds):
-        p = precision_score(labels, preds, zero_division=0)
-        r = recall_score(labels, preds, zero_division=0)
-        f1 = f1_score(labels, preds, zero_division=0)
-        return {"Method": name, "Precision": round(p, 3), "Recall": round(r, 3), "F1-Score": round(f1, 3)}
+    # 7. Forecast performance metrics
+    mae = mean_absolute_error(y_test, preds)
 
-    results = [
-        get_metrics("Standalone (Isolation Forest)", iso_pred),
-        get_metrics("Forecast-Based (Residual)", forecast_pred),
-        get_metrics("Hybrid (Combined)", hybrid_pred)
-    ]
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
 
-    print("\n=== ANOMALY DETECTION EVALUATION ===")
-    print(pd.DataFrame(results).to_string(index=False))
+    print("\n=== FORECASTING PERFORMANCE ===")
 
-    # --- Simulated Energy Savings ---
-    # Assume the hybrid model catches 3 anomalies, each wasting 15 kWh.
-    # Cost is $0.15 per kWh.
-    anomalies_caught = hybrid_pred.sum()
-    wasted_kwh = anomalies_caught * 15 
-    cost_saved = wasted_kwh * 0.15
-    
-    print("\n=== SIMULATED ENERGY SAVINGS ===")
-    print(f"Anomalies Caught: {anomalies_caught}")
-    print(f"Estimated Energy Wasted: {wasted_kwh} kWh")
-    print(f"Estimated Cost Saved (at $0.15/kWh): ${cost_saved:.2f}")
+    print(f"MAE:  {mae:.4f} kWh")
+    print(f"RMSE: {rmse:.4f} kWh")
+
+    # 8. Anomaly detection results
+    print("\n=== ANOMALY DETECTION RESULTS ===")
+
+    results = pd.DataFrame({
+        "Method": [
+            "Isolation Forest",
+            "Forecast-Based",
+            "Hybrid"
+        ],
+        "Anomalies Detected": [
+            int(iso_pred.sum()),
+            int(forecast_pred.sum()),
+            int(hybrid_pred.sum())
+        ],
+        "Percentage of Test Data": [
+            round(iso_pred.mean() * 100, 2),
+            round(forecast_pred.mean() * 100, 2),
+            round(hybrid_pred.mean() * 100, 2)
+        ]
+    })
+
+    print(results.to_string(index=False))
+
+    # 9. Save actual detected anomalies
+    anomaly_results = test_data[
+        ["timestamp", "consumption_kwh"]
+    ].copy()
+
+    anomaly_results["isolation_forest"] = iso_pred
+    anomaly_results["forecast_based"] = forecast_pred
+    anomaly_results["hybrid"] = hybrid_pred
+    anomaly_results["z_score"] = z_scores
+
+    anomaly_results.to_csv(
+        "data/anomaly_results.csv",
+        index=False
+    )
+
+    print("\nAnomaly results saved to data/anomaly_results.csv")
+
+    print("\nEvaluation completed successfully.")
+
 
 if __name__ == "__main__":
     run_evaluation()

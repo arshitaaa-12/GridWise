@@ -1,75 +1,117 @@
-import pandas as pd
-import numpy as np
-import os
 
-# --- CHECK THIS FILENAME ---
-INPUT_FILE = "data/household_power_consumption.txt" 
+import pandas as pd
+import os
+import requests
+
+INPUT_FILE = "data/household_power_consumption.txt"
+OUTPUT_FILE = "data/consumption.csv"
+
 
 def process_data():
-    print(f"Loading {INPUT_FILE}...")
-    
+    print("Loading real electricity dataset...")
+
     if not os.path.exists(INPUT_FILE):
-        print(f"❌ File not found at {INPUT_FILE}. Please check the name and location.")
+        print("Dataset not found:", INPUT_FILE)
         return
 
-    # 1. Read and clean the file line by line
-    valid_lines = []
-    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            # Kaggle UCI file uses semicolons. If yours uses commas, change ';' to ','
-            if ';' in line:
-                # Clean weird characters and quotes
-                clean_line = line.replace('"', '').strip()
-                valid_lines.append(clean_line)
+    # Read original UCI/Kaggle data
+    df = pd.read_csv(
+        INPUT_FILE,
+        sep=";",
+        na_values=["?"],
+        low_memory=False
+    )
 
-    print(f"Valid lines read: {len(valid_lines)}")
+    df.columns = df.columns.str.strip()
 
-    # 2. Convert to Pandas DataFrame
-    from io import StringIO
-    csv_data = StringIO("\n".join(valid_lines))
-    
-    # Read the data, forcing bad lines to be skipped
-    df = pd.read_csv(csv_data, sep=';', na_values=['?'], on_bad_lines='skip', low_memory=False)
-    
-    # Clean column names
-    df.columns = [c.strip() for c in df.columns]
-    print(f"Columns found: {df.columns.tolist()}")
+    # Create timestamp
+    df["timestamp"] = pd.to_datetime(
+        df["Date"].astype(str) + " " + df["Time"].astype(str),
+        format="%d/%m/%Y %H:%M:%S",
+        errors="coerce"
+    )
 
-    # 3. Create a proper timestamp
-    if 'Date' in df.columns and 'Time' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
-    elif 'timestamp' not in df.columns:
-        raise ValueError("Could not find Date/Time columns. Check the column names printed above.")
+    df["Global_active_power"] = pd.to_numeric(
+        df["Global_active_power"], errors="coerce"
+    )
 
-    # 4. Get the consumption column
-    if 'Global_active_power' in df.columns:
-        df['consumption_kwh'] = pd.to_numeric(df['Global_active_power'], errors='coerce')
-    elif 'consumption_kwh' not in df.columns:
-        raise ValueError("Could not find Global_active_power. Check the column names printed above.")
+    df = df.dropna(
+        subset=["timestamp", "Global_active_power"]
+    )
 
-    # 5. Drop bad rows and resample to hourly
-    df = df.dropna(subset=['timestamp', 'consumption_kwh'])
-    print("Resampling minute data to hourly data...")
-    
-        df = df.set_index('timestamp')
-    # We use MEAN instead of SUM because the data is already in kW.
-    # Averaging the hour gives us the kW for that hour (which is kWh).
-    hourly_df = df[['consumption_kwh']].resample('h').mean().reset_index()
-    hourly_df = hourly_df.dropna()
-    
-    # Clean the data to prevent database errors
-    hourly_df['consumption_kwh'] = hourly_df['consumption_kwh'].round(3)
-    
-    # 6. Add Synthetic Weather (UCI dataset doesn't have weather)
-    np.random.seed(42)
-    n = len(hourly_df)
-    hours = np.arange(n)
-    hourly_df['temperature_c'] = 25 + 8 * np.sin(2 * np.pi * hours / (24 * 365)) + np.random.normal(0, 1, n)
-    hourly_df['humidity_pct'] = 60 + np.random.normal(0, 5, n)
+    df = df.sort_values("timestamp").set_index("timestamp")
 
-    # 7. Save it
-    hourly_df.to_csv("data/consumption.csv", index=False)
-    print(f"✅ Processed and saved {len(hourly_df)} hours of REAL data to data/consumption.csv")
+    print("Converting minute-level power into hourly energy...")
+
+    # Each reading is kW for approximately one minute.
+    # Sum valid readings and divide by 60 to get hourly kWh.
+    hourly_energy = (
+        df["Global_active_power"]
+        .resample("h")
+        .sum(min_count=60) / 60
+    )
+
+    hourly_df = hourly_energy.dropna().reset_index()
+    hourly_df.columns = ["timestamp", "consumption_kwh"]
+
+    print("Downloading historical weather data...")
+
+    start_date = hourly_df["timestamp"].min().strftime("%Y-%m-%d")
+    end_date = hourly_df["timestamp"].max().strftime("%Y-%m-%d")
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+
+    params = {
+        "latitude": 48.776,
+        "longitude": 2.293,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": "temperature_2m,relative_humidity_2m",
+        "timezone": "Europe/Paris"
+    }
+
+    response = requests.get(url, params=params, timeout=120)
+    response.raise_for_status()
+
+    weather = response.json()["hourly"]
+
+    weather_df = pd.DataFrame({
+        "timestamp": pd.to_datetime(weather["time"]),
+        "temperature_c": weather["temperature_2m"],
+        "humidity_pct": weather["relative_humidity_2m"]
+    })
+
+    # Match electricity and weather timestamps
+    hourly_df["timestamp"] = pd.to_datetime(
+    hourly_df["timestamp"]
+)
+
+    weather_df["timestamp"] = pd.to_datetime(
+    weather_df["timestamp"]
+)
+
+    final_df = hourly_df.merge(
+        weather_df,
+        on="timestamp",
+        how="inner"
+    )
+
+    final_df = final_df.dropna()
+
+
+    final_df["consumption_kwh"] = (
+        final_df["consumption_kwh"].round(4)
+    )
+
+    os.makedirs("data", exist_ok=True)
+
+    final_df.to_csv(OUTPUT_FILE, index=False)
+
+    print("\nDataset successfully created!")
+    print("Total records:", len(final_df))
+    print(final_df.head())
+    print("\nSaved to:", OUTPUT_FILE)
+
 
 if __name__ == "__main__":
     process_data()
