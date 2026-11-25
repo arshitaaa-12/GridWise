@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+ml-service/models/
+ml-service/data/household_power_consumption.txt
+ml-service/data/consumption.csv
+
+# Node
+node_modules/
+npm-debug.log
+
+# Env
+.env
+
+# VSCode / OS
+.vscode/
+.DS_Store
+Thumbs.db
